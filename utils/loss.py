@@ -131,6 +131,7 @@ class ComputeLoss:
                 ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
 
                 # Regression
+                # yr: 每个目标的预测之为[x, y, w, h, obj_conf, class1_conf, class2_conf, ..., classn_conf]
                 pxy = ps[:, :2].sigmoid() * 2 - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box

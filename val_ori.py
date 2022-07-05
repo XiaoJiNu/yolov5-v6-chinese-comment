@@ -11,7 +11,7 @@ Usage - formats:
                                       yolov5s.onnx               # ONNX Runtime or OpenCV DNN with --dnn
                                       yolov5s.xml                # OpenVINO
                                       yolov5s.engine             # TensorRT
-                                      yolov5s.mlmodel            # CoreML (macOS-only)
+                                      yolov5s.mlmodel            # CoreML (MacOS-only)
                                       yolov5s_saved_model        # TensorFlow SavedModel
                                       yolov5s.pb                 # TensorFlow GraphDef
                                       yolov5s.tflite             # TensorFlow Lite
@@ -21,7 +21,6 @@ Usage - formats:
 import argparse
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 from threading import Thread
@@ -29,9 +28,6 @@ from threading import Thread
 import numpy as np
 import torch
 from tqdm import tqdm
-
-from utils.plots import Annotator, colors, save_one_box
-import cv2
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -42,10 +38,10 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 from models.common import DetectMultiBackend
 from utils.callbacks import Callbacks
 from utils.datasets import create_dataloader
-from utils.general import (LOGGER, check_dataset, check_img_size, check_requirements, check_yaml,
+from utils.general import (LOGGER, box_iou, check_dataset, check_img_size, check_requirements, check_yaml,
                            coco80_to_coco91_class, colorstr, increment_path, non_max_suppression, print_args,
                            scale_coords, xywh2xyxy, xyxy2xywh)
-from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
+from utils.metrics import ConfusionMatrix, ap_per_class
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, time_sync
 
@@ -66,11 +62,10 @@ def save_one_json(predn, jdict, path, class_map):
     box = xyxy2xywh(predn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
     for p, b in zip(predn.tolist(), box.tolist()):
-        jdict.append({
-            'image_id': image_id,
-            'category_id': class_map[int(p[5])],
-            'bbox': [round(x, 3) for x in b],
-            'score': round(p[4], 5)})
+        jdict.append({'image_id': image_id,
+                      'category_id': class_map[int(p[5])],
+                      'bbox': [round(x, 3) for x in b],
+                      'score': round(p[4], 5)})
 
 
 def process_batch(detections, labels, iouv):
@@ -92,81 +87,13 @@ def process_batch(detections, labels, iouv):
             matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
             # matches = matches[matches[:, 2].argsort()[::-1]]
             matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-        matches = torch.from_numpy(matches).to(iouv.device)
+        matches = torch.Tensor(matches).to(iouv.device)
         correct[matches[:, 1].long()] = matches[:, 2:3] >= iouv
     return correct
 
 
-def draw_labels_and_predict_boxes(
-        pred_boxes,
-        label_boxes,
-        img_with_pred_boxes,
-        img_with_label_boxes,
-        names):
-    """
-    传入所有预测方框和标签方框，以及对应的图片，然后在图片上画框
-    pred_boxes: 预测方框，(Array[N, 6]), x1, y1, x2, y2, conf, class
-    label_boxes: 标签方框，(Array[M, 5]), class, x1, y1, x2, y2
-    img_with_pred_boxes: 用于画预测方框的图片
-    img_with_label_boxes: 用于画标签方框的图片
-    names: 类别名字
-    """
-    # c = int(cls)  # integer class
-    # label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-    # annotator.box_label(xyxy, label, color=colors(c, True))
-
-    # draw predict results
-    annotator_pred = Annotator(img_with_pred_boxes, line_width=1, example=str(names))
-    for *xyxy, conf, cls in reversed(pred_boxes):
-        c = int(cls)  # integer class
-        # label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-        label = f'{names[c]} {conf:.2f}'
-        annotator_pred.box_label(xyxy, label, color=colors(c, True))
-    img_with_pred_boxes = annotator_pred.result()
-
-    # draw label results
-    annotator_label = Annotator(img_with_label_boxes, line_width=1, example=str(names))
-    for cls, *xyxy in reversed(label_boxes):
-        c = int(cls)  # integer class
-        # label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-        label = f'{names[c]}'
-        annotator_label.box_label(xyxy, label, color=colors(c, True))
-    img_with_label_boxes = annotator_label.result()
-
-    # for testing
-    # cv2.imwrite(r'data/fp_fn_imgs/test_pred.jpg', img_with_pred_boxes)
-    # cv2.imwrite(r'data/fp_fn_imgs/test_label.jpg', img_with_label_boxes)
-
-    return img_with_pred_boxes, img_with_label_boxes
-
-
-def save_fp_fn_img(ori_img_path, fp_fn_save_dir, is_fp_or_fn,
-                   img_with_pred_boxes, img_with_label_boxes):
-    """
-    用于保存检测结果中有误检fp或者漏检fn的图片所对于那个的原始图片，预测图片和标签图片
-    ori_img_path: 图片原始路径
-    fp_fn_save_dir: 保存所有fp,fn所有图片的文件夹根目录。根目录下有fp,fn两个文件夹目录
-    is_fp_or_fn: 表示图片是fp还是fn
-    img_with_pred_boxes: 画了预测框的图片
-    img_with_label_boxes: 画了标签方框的图片
-    """
-    img_name = os.path.split(ori_img_path)[-1]
-    # 保存画了预测框的图片
-    img_pred_name = img_name.replace('.jpg', '_pred.jpg')
-    img_pred_save_path = os.path.join(fp_fn_save_dir, is_fp_or_fn, img_pred_name)
-    cv2.imwrite(img_pred_save_path, img_with_pred_boxes)
-    # 保存画了标签方框的图片
-    img_label_name = img_name.replace('.jpg', '_label.jpg')
-    img_label_save_path = os.path.join(fp_fn_save_dir, is_fp_or_fn, img_label_name)
-    cv2.imwrite(img_label_save_path, img_with_label_boxes)
-    # 保存原始图片
-    img_save_path = os.path.join(fp_fn_save_dir, is_fp_or_fn, img_name)
-    shutil.copy(ori_img_path, img_save_path)
-
-
 @torch.no_grad()
-def run(
-        data,
+def run(data,
         weights=None,  # model.pt path(s)
         batch_size=32,  # batch size
         imgsz=640,  # inference size (pixels)
@@ -193,12 +120,12 @@ def run(
         plots=True,
         callbacks=Callbacks(),
         compute_loss=None,
-        fp_fn_save_dir=r'data/fp_fn_imgs'
-):
+        ):
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
         device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
+
         half &= device.type != 'cpu'  # half precision only supported on CUDA
         model.half() if half else model.float()
     else:  # called directly
@@ -209,80 +136,51 @@ def run(
         (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
         # Load model
-        # model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
         model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data)
-
-        stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
+        stride, pt, jit, onnx, engine = model.stride, model.pt, model.jit, model.onnx, model.engine
         imgsz = check_img_size(imgsz, s=stride)  # check image size
-        # half = model.fp16  # FP16 supported on limited backends with CUDA
-        if engine:
+        half &= (pt or jit or onnx or engine) and device.type != 'cpu'  # FP16 supported on limited backends with CUDA
+        if pt or jit:
+            model.model.half() if half else model.model.float()
+        elif engine:
             batch_size = model.batch_size
         else:
-            device = model.device
-            if not (pt or jit):
-                batch_size = 1  # export.py models default to batch-size 1
-                LOGGER.info(f'Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for non-PyTorch models')
+            half = False
+            batch_size = 1  # export.py models default to batch-size 1
+            device = torch.device('cpu')
+            LOGGER.info(f'Forcing --batch-size 1 square inference shape(1,3,{imgsz},{imgsz}) for non-PyTorch backends')
 
         # Data
         data = check_dataset(data)  # check
 
     # Configure
     model.eval()
-    cuda = device.type != 'cpu'
-    is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
+    is_coco = isinstance(data.get('val'), str) and data['val'].endswith('coco/val2017.txt')  # COCO dataset
     nc = 1 if single_cls else int(data['nc'])  # number of classes
-    iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
+    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
 
     # Dataloader
     if not training:
-        if pt and not single_cls:  # check --weights are trained on --data
-            ncm = model.model.nc
-            assert ncm == nc, f'{weights[0]} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
-                              f'classes). Pass correct combination of --weights and --data that are trained together.'
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz), half=half)  # warmup
         pad = 0.0 if task in ('speed', 'benchmark') else 0.5
         rect = False if task == 'benchmark' else pt  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task],
-                                       imgsz,
-                                       batch_size,
-                                       stride,
-                                       single_cls,
-                                       pad=pad,
-                                       rect=rect,
-                                       workers=workers,
-                                       prefix=colorstr(f'{task}: '))[0]
+        dataloader = create_dataloader(data[task], imgsz, batch_size, stride, single_cls, pad=pad, rect=rect,
+                                       workers=workers, prefix=colorstr(f'{task}: '))[0]
 
     seen = 0
-    # confusion_matrix = ConfusionMatrix(nc=nc)
-    confusion_matrix = ConfusionMatrix(nc=nc, conf=conf_thres, iou_thres=iou_thres)
+    confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
     s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     dt, p, r, f1, mp, mr, map50, map = [0.0, 0.0, 0.0], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
-    callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
-
-    #  -----计算结果指标的的过程-----
-    # 1. 每次遍历一个batch图片
-    # 2. infer这个batch图片得到infer结果
-    # 3. NMS得到NMS后的结果
-    # 4. 计算指标(Metrics部分)，步骤如下
-    #      遍历这个batch结果的一张图片的结果
-    #          提取这张图片对应的标签结果
-    #          将这张图片的预测结果映射回原图尺寸(Predictions部分)
-    #          计算每个预测狂在IOU=0.5到IOU=0.95时是否预测正确，即是否有满足大于对应IOU指标的标签。结果保存在correct这个tensor中
-    #          保存每张图片的(correct, conf, pcls, tcls)结果，conf, pcls, tcls分别表示目标的预测分数、类别以及对应的标签
-    #          如果要要是结果，还要计算混淆矩阵。confusion_matrix.process_batch(predn, labelsn)实现。(重点，这里可以得到FP和FN，
-    #      用于提取预测错误的结果)
-
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
-        callbacks.run('on_val_batch_start')
         t1 = time_sync()
-        if cuda:
+        if pt or jit or engine:
             im = im.to(device, non_blocking=True)
             targets = targets.to(device)
         im = im.half() if half else im.float()  # uint8 to fp16/32
@@ -300,19 +198,11 @@ def run(
             loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
 
         # NMS
-        targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+        targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         t3 = time_sync()
-        # one item of out is [x1, y1, x2, y2, conf, cls]
         out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls)
         dt[2] += time_sync() - t3
-
-        # ---------- 筛选FP，FN样本 ----------
-        # 1. 对于每张图片，在confusion_matrix.process_batch(predn, labelsn)中返回FP，FN的数量。以一个字典的形式返回，
-        #    字典形式如下：{"fp_num": fp_count, "fn_num": fn_count}
-        # 2. 如果FN > 0，将这个样本保存在FN的文件夹中
-        # 3. 如果FN = 0 && FP > 0，将这个样本保存在FP的文件夹中
-        # 4. 如果FN = 0 && FP = 0，不筛选这个图片
 
         # Metrics
         for si, pred in enumerate(out):
@@ -320,18 +210,17 @@ def run(
             # si是当前图片在这个batch中的id
             # pred是预测值
             # targets中，一个方框包含信息为[batch_id, class_id, x, y, w, h]
-            # targets[:, 0] == si取出了标签中对应第si张图的在targets中所有方框标签。然后targets[targets[:, 0] == si, 1:]
+            # targets[:, 0] == si取出了标签中对应第si张图的所有方框标签。然后targets[targets[:, 0] == si, 1:]
             # 取出了这些标签中的[class_id, x, y, w, h]
             labels = targets[targets[:, 0] == si, 1:]
-            nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
+            nl = len(labels)
+            tcls = labels[:, 0].tolist() if nl else []    # target class
             path, shape = Path(paths[si]), shapes[si][0]  # 得到当前处理图片的路径和维度h,w
-            # correct: [npr x niou] = [npr x 10]，后面用于存储每个预测框在IOU=[0.5:0.95]范围内每个IOU情况下，这个预测狂是否有对应真是标签
-            correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             seen += 1
 
-            if npr == 0:
+            if len(pred) == 0:
                 if nl:
-                    stats.append((correct, *torch.zeros((3, 0), device=device)))
+                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
                 continue
 
             # Predictions
@@ -344,44 +233,13 @@ def run(
             if nl:
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
                 scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                # labelsn一个目标为[class_id, x1, y1, x2, y2]
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
                 correct = process_batch(predn, labelsn, iouv)
-
-                # ---------- yr: 分别在图上画出标签方框和预测方框----------
-                # 1. 复制出两张新的图片
-                # 2. 调用annotator.box_label(xyxy, label, color=colors(c, True))分别画标签方框和预测方框
-                # 3. 传入save_fp_fn_img()函数保存标签结果和预测结果
-                # img_numpy = im.cpu().numpy()[si, ...]
-                # img_with_pred_boxes = np.transpose(img_numpy, (1, 2, 0))
-                # img_with_pred_boxes = np.ascontiguousarray(img_with_pred_boxes)
-                img_ori = cv2.imread(str(path))
-                img_with_pred_boxes = img_ori.copy()  # 用于画预测方框的图片
-                img_with_label_boxes = img_ori.copy()  # 用于画标签方框的图片
-                # 画框
-                # predn (Array[N, 6]), x1, y1, x2, y2, conf, class
-                # labels (Array[M, 5]), class, x1, y1, x2, y2
-                # predn = predn[predn[:, 4] > conf_thres]  #
-
-                img_with_pred_boxes, img_with_label_boxes = draw_labels_and_predict_boxes(
-                    predn, labelsn, img_with_pred_boxes, img_with_label_boxes, names)
-
-                # ----- 这里会计算FN，FP以及预测正确的样本 -----
                 if plots:
-                    fp_fn_dict = {}
-                    fp_fn_dict = confusion_matrix.process_batch(predn, labelsn)
-                    fp_count = fp_fn_dict["fp_num"]
-                    fn_count = fp_fn_dict["fn_num"]
-
-                    # 筛选样本
-                    if fn_count > 0:
-                        is_fp_or_fn = "fn"
-                        save_fp_fn_img(path, fp_fn_save_dir, is_fp_or_fn, img_with_pred_boxes, img_with_label_boxes)
-                    elif fn_count == 0 and fp_count > 0:
-                        is_fp_or_fn = "fp"
-                        save_fp_fn_img(path, fp_fn_save_dir, is_fp_or_fn, img_with_pred_boxes, img_with_label_boxes)
-
-            stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
+                    confusion_matrix.process_batch(predn, labelsn)
+            else:
+                correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool)
+            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))  # (correct, conf, pcls, tcls)
 
             # Save/log
             if save_txt:
@@ -397,10 +255,8 @@ def run(
             f = save_dir / f'val_batch{batch_i}_pred.jpg'  # predictions
             Thread(target=plot_images, args=(im, output_to_target(out), paths, f, names), daemon=True).start()
 
-        callbacks.run('on_val_batch_end')
-
     # Compute metrics
-    stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
@@ -447,7 +303,7 @@ def run(
             pred = anno.loadRes(pred_json)  # init predictions api
             eval = COCOeval(anno, pred, 'bbox')
             if is_coco:
-                eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.im_files]  # image IDs to evaluate
+                eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.img_files]  # image IDs to evaluate
             eval.evaluate()
             eval.accumulate()
             eval.summarize()
@@ -472,8 +328,8 @@ def parse_opt():
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model.pt path(s)')
     parser.add_argument('--batch-size', type=int, default=2, help='batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.1, help='confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.45, help='NMS IoU threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
@@ -489,16 +345,12 @@ def parse_opt():
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
-    parser.add_argument('--fp_fn_save_dir', type=str, default=r'data/fp_fn_imgs',
-                        help='fp and fn images save directory')
-
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.save_txt |= opt.save_hybrid
-    # print_args(FILE.stem, vars(opt))
+    print_args(FILE.stem, opt)
     return opt
-
 
 def main(opt):
     check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))

@@ -31,21 +31,24 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
     # Returns
         The average precision as computed in py-faster-rcnn.
     """
-
     # Sort by objectness
     i = np.argsort(-conf)
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
     # Find unique classes
     unique_classes, nt = np.unique(target_cls, return_counts=True)
+    # nc当前图片的中存在的目标标签的数量
     nc = unique_classes.shape[0]  # number of classes, number of detections
 
     # Create Precision-Recall curve and compute AP for each class
     px, py = np.linspace(0, 1, 1000), []  # for plotting
+    # ap: [nc x 10]，保存每个类别在IOU=0.5到IOU=0.95情况下的ap值
     ap, p, r = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
     for ci, c in enumerate(unique_classes):
+        # ----- 每次循环的时候，计算一个类别的在IOU=0.5到IOU=0.95情况下的ap值 -----
+        # pred_cls shape: 25267, shape of i:
         i = pred_cls == c
-        n_l = nt[ci]  # number of labels
+        n_l = nt[ci]  # number of labels，
         n_p = i.sum()  # number of predictions
 
         if n_p == 0 or n_l == 0:
@@ -55,7 +58,6 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
             fpc = (1 - tp[i]).cumsum(0)
             tpc = tp[i].cumsum(0)
 
-            # Recall
             recall = tpc / (n_l + eps)  # recall curve
             r[ci] = np.interp(-px, -conf[i], recall[:, 0], left=0)  # negative x, xp because xp decreases
 
@@ -63,11 +65,17 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
             precision = tpc / (tpc + fpc)  # precision curve
             p[ci] = np.interp(-px, -conf[i], precision[:, 0], left=1)  # p at pr_score
 
+            # ---------- yr: 对于每个类别的错误检测信息，可以在这里得到，并且可以根据错误类分别提取错误检测的图片----------
             # AP from recall-precision curve
             for j in range(tp.shape[1]):
+                # tp.shape[1]=10, 表示这里循环IOU=0.5到IOU=0.95的情况
+                # 每次遍历计算对应IOU情况下的ap。
+                # ap[ci, j]存储了第ci类目标对应的j个IOU值所对应的ap值。
                 ap[ci, j], mpre, mrec = compute_ap(recall[:, j], precision[:, j])
                 if plot and j == 0:
                     py.append(np.interp(px, mrec, mpre))  # precision at mAP@0.5
+
+    # ---------- yr: 如果只是想提取错误检测的图片，在这里 ----------
 
     # Compute F1 (harmonic mean of precision and recall)
     f1 = 2 * p * r / (p + r + eps)
@@ -132,15 +140,25 @@ class ConfusionMatrix:
         Returns:
             None, updates confusion matrix accordingly
         """
+        # yr: 添加筛选出现FP，FN样本的功能
+        fp_count = 0  # 统计误检的数量
+        fn_count = 0  # 统计漏检的数量
+
         detections = detections[detections[:, 4] > self.conf]
         gt_classes = labels[:, 0].int()
         detection_classes = detections[:, 5].int()
+        # iou: [17x11]，表示有17个标签方框，11个预测方框。每一行表示一个标签方框和11个预测方框的各自对应iou值
         iou = box_iou(labels[:, 1:], detections[:, :4])
 
+        # x:(tuple: 2)。得到了iou tensor中满足标签和预测值的iou值大于阈值的那些索引，索引值以两个元组列表分别存储对应索引的(x,y)值
         x = torch.where(iou > self.iou_thres)
-        if x[0].shape[0]:
+        if x[0].shape[0]:  # 判断x是否有元素，如果有才处理
+            temp1 = torch.stack(x, 1)         # [11x2]
+            temp2 = iou[x[0], x[1]]           # [11]
+            temp3 = iou[x[0], x[1]][:, None]  # [11x1]
+            # matches: [11x3]，每一行表示，在iou这个tensor中，标签和预测框的iou值大于阈值的那些元素的索引x,y以及对应iou的值
             matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
-            if x[0].shape[0] > 1:
+            if x[0].shape[0] > 1:  # 判断大于阈值的iou的元素是否多余两个
                 matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
                 matches = matches[matches[:, 2].argsort()[::-1]]
@@ -156,11 +174,17 @@ class ConfusionMatrix:
                 self.matrix[detection_classes[m1[j]], gc] += 1  # correct
             else:
                 self.matrix[self.nc, gc] += 1  # background FP
+                fp_count += 1
 
         if n:
             for i, dc in enumerate(detection_classes):
                 if not any(m1 == i):
                     self.matrix[dc, self.nc] += 1  # background FN
+                    fn_count += 1
+
+        return {"fp_num": fp_count, "fn_num": fn_count}
+
+
 
     def matrix(self):
         return self.matrix

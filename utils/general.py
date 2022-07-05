@@ -677,12 +677,21 @@ def clip_coords(boxes, shape):
 def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
                         labels=(), max_det=300):
     """Runs Non-Maximum Suppression (NMS) on inference results
+    prediction: 1x18900x85，
+        1. 这里的18900怎么来的？
+        这个维度由输入图片尺寸决定。这里图片shape为hxw=480x640，最终三个特征层维度为原图缩小8倍，16倍，32倍得到，尺度为
+        60x80,30x40,15x20。每个特征图上一个元素对应3个anchor输出值，所以最终所有anchor输出的数量有(60x80x3)+(30x40x3)+
+        (15x20x3) = 18900
+        2. 85怎么来的？
+        每个anchor会预测当前目标的x,y,w,h,confidence这5个值以及coco的80个类别对应每个类别的分数，所以为5+80=85
+
 
     Returns:
          list of detections, on (n,6) tensor per image [xyxy, conf, cls]
     """
 
     nc = prediction.shape[2] - 5  # number of classes
+    # 这里判断每个anchor预测目标得分是否大于阈值conf_thres
     xc = prediction[..., 4] > conf_thres  # candidates
 
     # Checks
@@ -700,8 +709,14 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
     t = time.time()
     output = [torch.zeros((0, 6), device=prediction.device)] * prediction.shape[0]
     for xi, x in enumerate(prediction):  # image index, image inference
+        # ----- 一次循环处理一张图片的预测值，prediction包含一个batch所有图片的预测值，一共循环batch次 -----
+
         # Apply constraints
+        # 第一层过滤 虑除超小anchor标和超大anchor
         x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        # 这里xc[xi]取出了当前图片的预测值
+        temp1 = xc[xi]
+        # 第二层过滤，这里筛选出了目标得分大于阈值conf_thres的那些anchor的预测值
         x = x[xc[xi]]  # confidence
 
         # Cat apriori labels if autolabelling
@@ -728,8 +743,10 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
             i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
             x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
         else:  # best class only
+            # 这里的j表示得分最高类别的id
             conf, j = x[:, 5:].max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
+            # ---------- 将满足阈值得分的目标的[x1, y1, x2, y2, conf, id]合并在一起 ----------
+            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]  # 49x6
 
         # Filter by class
         if classes is not None:
@@ -747,8 +764,16 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
             x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence
 
         # Batched NMS
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
+        # ----- 这里的c用来做什么？？ -----
+        # 参考https://blog.csdn.net/flyfish1986/article/details/119177472
+        # 这里的c是将每个目标方框的类别数乘以一个很大的数max_wh得到的数值列表，不同类别在c中对应的值不同，相同类别的对应值相同。
+        # 主要用途在于：
+        #   在下面的 boxes = x[:, :4] + c 中，不同类别的目标方框的坐标加上对应的c中一个很大的数值后，这些目标方框方框
+        #   会聚集在不同的位置，不同类别方框不会重叠干扰。然后就不需要分类别进行nms，可以直接把所有类别的方框当作一个类别来nms。
+        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes，49x1
         boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
+        # 前面所有方框根据类别加上很大数后，不同类别方框不会影响，这里直接当所一个类别进行nms，
+        # 直接返回nms后剩下的方框在boxes(也对应x)中的索引i。后面根据索引i就索引得到最终的目标方框。
         i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
         if i.shape[0] > max_det:  # limit detections
             i = i[:max_det]
@@ -760,6 +785,7 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
             if redundant:
                 i = i[iou.sum(1) > 1]  # require redundancy
 
+        # 根据nms剩下方框在x中的索引得到当前图片预测得到的最终目标方框
         output[xi] = x[i]
         if (time.time() - t) > time_limit:
             LOGGER.warning(f'WARNING: NMS time limit {time_limit}s exceeded')
