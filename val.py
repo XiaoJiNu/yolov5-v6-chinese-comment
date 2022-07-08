@@ -79,20 +79,77 @@ def process_batch(detections, labels, iouv):
     Arguments:
         detections (Array[N, 6]), x1, y1, x2, y2, conf, class
         labels (Array[M, 5]), class, x1, y1, x2, y2
+        iouv [0.50000, 0.55000, 0.60000, 0.65000, 0.70000, 0.75000, 0.80000, 0.85000, 0.90000, 0.95000]
     Returns:
         correct (Array[N, 10]), for 10 IoU levels
     """
+    # detections: 16x6
+    # labels: 17x5
+    # correct: 16x10
+    # 每一行用于表示每个预测目标方框和对应标签方框的IOU是否大于等于0.5-0.95的中的元素，比如预测目标和标签IOU=0.6，
+    # 则它在correct所在行为[True, True, True, False, False, False, False, False, False, False]
     correct = torch.zeros(detections.shape[0], iouv.shape[0], dtype=torch.bool, device=iouv.device)
+    # iou: 17x16 每行表示一个标签方框和每个预测方框的iou值
     iou = box_iou(labels[:, 1:], detections[:, :4])
+
+    # ---------- x = torch.where((iou >= iouv[0]) & (labels[:, 0:1] == detections[:, 5])) 注释----------
+    temp1 = (iou >= iouv[0])                       # 17x16
+    temp2 = (labels[:, 0:1] == detections[:, 5])   # 17x16
+    temp21 = labels[:, 0:1]     # 17x1
+    temp22 = detections[:, 5]   # 这种索引方式得到的结果从detections的2维变成了1维，元素数量为16
+    temp23 = detections[:, 5:]  # detections为16x6的2维tensor，这种索引方式得到的结果依然为16x1的2维tensor
+    # temp2由temp21和temp22得到，则17x1和16的一维tensor经过广播的到了17x16的维度。
+    # temp2的每一行表示一个标签方框和16个预测方框的各自类别是否相同
+
+    # temp3: 17x16
+    # temp3一行表示一个标签方框和所有预测方框进行比较结果，如果一个预测方框和该行表示的标签gt方框的iou大于0.5且他们的类别相同，
+    # 认为它们正确预测了，temp3中对应元素为True。
+    temp3 = temp1 & temp2
+    # x:两个元组，保存了temp3这个2维tensor中标签gt方框和预测方框正确预测的那些元素的索引，分别为索引的x和y值。
+    # x中第一个元组保存的索引实质是***正确预测的gt方框在labels中的索引***
+    # x中第二个元组保存的索引实质是***正确预测的预测方框在预测结果detections中的索引***
     x = torch.where((iou >= iouv[0]) & (labels[:, 0:1] == detections[:, 5]))  # IoU above threshold and classes match
-    if x[0].shape[0]:
+    if x[0].shape[0]:  # 如果存在标签和预测方框正确预测了，进行下面的拼接和去重处理
+        temp_matches1 = torch.stack(x, 1)  # 8x2，正确预测了的标签和预测方框在labels和detections中的索引
+        temp_matches2 = iou[x[0], x[1]]    # 长度为8的一维tensor，表示正确预测了的标签和预测方框的iou
+        temp_matches3 = iou[x[0], x[1]][:, None]  # 8x1，将temp_matches2变成8x1的维度
+        # matches: 8x3, 将正确预测了的标签和预测方框的在labels和detections中的索引和iou拼接在一起
         matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detection, iou]
+        # ----- 去重处理 -----
+        # 如果正确预测了的标签和预测方框的数量不止一个，有可能一个gt框对应多个预测框或和一个预测框对应多个gt框
+        # 所以要去重
         if x[0].shape[0] > 1:
+            # temp1将正确预测了的标签和预测方框的iou进行升序排序，返回了从小到大的索引值
+            temp1 = matches[:, 2].argsort()
+            # temp2返回了从大到小的索引值，实现降序排列
+            temp2 = matches[:, 2].argsort()[::-1]
+            # 将正确预测了的标签和预测方框按照iou值进行降序排序
             matches = matches[matches[:, 2].argsort()[::-1]]
+
+            # matches[:, 1]取出了正确预测的预测方框在detections中的索引元素数组
+            temp1 = matches[:, 1]
+            # 预测方框去重。如果一个预测框匹配到多个gt，则只取第一次出现的预测框(**即和gt框iou最大那个预测框在detections中的索引值**)。
+            # 返回这些索引排序后的元组和排序后每个元素在temp1数组中对应的索引
+            temp2 = np.unique(matches[:, 1], return_index=True)
+            # 得到预测方框去重后元素在temp1数组中的索引，也即在matches中的索引
+            temp3 = np.unique(matches[:, 1], return_index=True)[1]
+            # 得到temp3后，在matches中提取出预测方框去重后剩下的元素，
+            # matches: 8x3
             matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
             # matches = matches[matches[:, 2].argsort()[::-1]]
+            # 同理，matches[:, 0]取出正确预测的gt框在labels中的索引组成的数组。
+            # 然后去重，对于一个gt框匹配了多个预测框的情况，取出和这些预测框iou最大的那个gt框在labels中索引
+            # *** 此时，matches得到了最终正确预测的gt框和预测框在labels和detections中的索引和iou，***
+            # *** 并且排除了一个gt框对应多个预测框和一个预测框对应多个gt框的情况***
+            # matches: 8x3
+            # 第一列为正确预测的gt框在labels中的索引
+            # 第二列为正确预测的预测框在detections中的索引
+            # 第三列为正确预测的gt和预测框的iou
             matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
         matches = torch.from_numpy(matches).to(iouv.device)
+        # 得到最终预测正确的预测框的信息
+        # 此时，correct中每一行就是预测正确的预测框，并且得到这个预测框和对应gt的iou值和IOU=0.5-0.95的大小比较结果。
+        # 大于为True，小于为False
         correct[matches[:, 1].long()] = matches[:, 2:3] >= iouv
     return correct
 
@@ -325,7 +382,7 @@ def run(
             labels = targets[targets[:, 0] == si, 1:]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
             path, shape = Path(paths[si]), shapes[si][0]  # 得到当前处理图片的路径和维度h,w
-            # correct: [npr x niou] = [npr x 10]，后面用于存储每个预测框在IOU=[0.5:0.95]范围内每个IOU情况下，这个预测狂是否有对应真是标签
+            # correct: [npr x niou] = [npr x 10]，后面用于存储每个预测框在IOU=[0.5:0.95]范围内每个IOU情况下，这个预测框是否有对应真是标签
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             seen += 1
 
