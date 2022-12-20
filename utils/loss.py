@@ -203,8 +203,8 @@ class ComputeLoss:
         # 都会负责检测每个目标。而后续的操作就是过滤出真正检测目标的anchor
         targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
+        # ----- 2. 设置后面筛选anchor时gt box的偏移量，用于后面在gt box附近筛选anchor?? -----
         g = 0.5  # bias
-        # ----- 2. 设置后面筛选anchor时gt box的偏移量，用于后面在gt box附近筛选anchor -----
         # ----------*****off用于后面筛选分配有anchor的目标所处的格子和它们相邻的格子*****----------
         # *****off的值为什么是[0, 0],[1, 0], [0, 1], [-1, 0], [0, -1]？？*****
         # 答：对应与后面的offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]和gij = (gxy - offsets).long()，
@@ -226,8 +226,8 @@ class ComputeLoss:
                             # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                             ], device=targets.device).float() * g  # offsets
 
-        # ----- 3. 遍历每个特征层，将每个目标分配到这个特征层对应的anchor. nl为最后用于检测的特征层数量 -----
-        for i in range(self.nl):
+        # ----- 3. 遍历每个特征层，将每个目标分配到这个特征层对应的anchor. -----
+        for i in range(self.nl):  # nl为最后用于检测的特征层数量
             # ----- 3.1 将gt box的x,y,w,h转换到当前特征图尺度下的坐标和宽高-----
             anchors = self.anchors[i]           # 得到当前anchor的尺度
             # temp1 = p[i].shape                # 这里得到了当前特征层的维度值，是一维向量，值为[16, 3, 80, 80, 85]
@@ -246,8 +246,8 @@ class ComputeLoss:
             t = targets * gain  # [3x204x7]*[7] --> [3x204x7]
             # ----- 当有目标标签存在时，进行标签和anchor匹配 -----
             if nt:
-                # ----- 3.2 Matches -----
-                # ----- 匹配achor和gt box，筛选出真正被分配有gt box的anchor对应的真实标签-----
+                # ----- Matches -----
+                # ----- 3.2 匹配achor和gt box，筛选出真正被分配有gt box的anchor对应的真实标签-----
                 # temp1 = t[:, :, 4:6]  # shape: [3x204x2]
                 # temp1的shape: [3x204x2]，取出所有目标的w,h。为了便于理解，可以假设把204维度去掉得到[3x2]的tensor，
                 # 可知每个目标的w,h复制了3次
@@ -395,7 +395,7 @@ class ComputeLoss:
             # 的左上角坐标x,y。这样就能找到每个目标匹配的anchor的具体位置
             indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
 
-            # -----添加当前特征层要预测的x,y,w,h对应的真实标签-----
+            # ----- 3.6 添加当前特征层要预测的x,y,w,h对应的真实标签-----
             # gxy - gij：筛选出来的目标在当前特征图尺度下的坐标减去用于预测它的格子的左上角坐标，得到cx,cy对应的预测偏差目标值
             # gwh:筛选出来的目标在当前特征图尺度下的宽高。
             # *** 归一化的预测偏差目标值在此处实现 ***
