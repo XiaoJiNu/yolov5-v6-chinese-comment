@@ -132,7 +132,14 @@ class ComputeLoss:
 
                 # Regression
                 # yr: 每个目标的预测之为[x, y, w, h, obj_conf, class1_conf, class2_conf, ..., classn_conf]
+                # 问题1 为什么 pxy范围在[-0.5, 1]内？
+                # 由于会选取相邻格子的anchor用于预测目标，格子以1为刻度划分。
+                # 例：如果gt框的x在[0,0.5)内，它左侧偏离1的格子会用于预测该目标，此时x坐标减去左侧格子左上角坐标，得到的偏差范围为[1, 1.5]
+                #    如果gt框的x在[0.5,1)内，它右侧偏离1的格子会用于预测该目标，此时x坐标减去右侧格子左上角坐标，得到的偏差范围为[-0.5, 0]
+                #    所以，最终需要预测的cx,cy的偏差范围在[-0.5, 1.5]以内
                 pxy = ps[:, :2].sigmoid() * 2 - 0.5
+                # 问题2 为什么是 [0,4]倍的anchors?
+                # 将预测限制为0-4,因为和做target的时候让gt的长宽分别与anchor长宽相除不超过4
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
@@ -178,12 +185,15 @@ class ComputeLoss:
         na, nt = self.na, targets.shape[0]  # number of anchors 3, targets=204
         tcls, tbox, indices, anch = [], [], [], []
         gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+        # ----- 1. 将每个gt box对应上3个anchor id，得到[num_anchor x num_gt x 7]-----
+        # ----- 这里的7代表(image_id,class,x,y,w,h,anchor_id) -----
         # temp1 = torch.arange(na, device=targets.device)              # 生成一维的向量，值为[0, 1, 2]
         # temp2 = torch.arange(na, device=targets.device).view(na, 1)  # 将[0, 1, 2]转换成三行一列的二维张量
-        # .repeat(1, nt)将[3x1]的   [[0] 在第一个维度上复制nt次，即在行方向上复制204次，得到维度为2x204的张量。[[0]，[0]，[0]...[0]
-        #                          [1]                                                               [1]，[1]，[1]...[1]
-        #                          [2]]                                                              [2]，[2]，[2]...[2]]
-        # ai: [3x204], ai应该是anchor id的缩写，表示anchor的序号
+        # .repeat(1, nt)将[3x1]的[[0] 在第一个维度上复制nt次，即在行方向上复制204次，得到维度为3x204的张量。[[0]，[0]，[0]...[0]
+        #                         [1]                                                                [1]，[1]，[1]...[1]
+        #                         [2]]                                                               [2]，[2]，[2]...[2]]
+        # ai: [3x204], ai应该是anchor id的缩写，表示anchor的序号.
+        # ai一列对应一个gt box的3个anchor的id
         ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
         # temp1 = targets.repeat(na, 1, 1)  # shape: [204x6] --> [3x204x6]
         # temp2 = ai[:, :, None]  # shape: [3x204x1]
@@ -194,6 +204,7 @@ class ComputeLoss:
         targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
         g = 0.5  # bias
+        # ----- 2. 设置后面筛选anchor时gt box的偏移量，用于后面在gt box附近筛选anchor -----
         # ----------*****off用于后面筛选分配有anchor的目标所处的格子和它们相邻的格子*****----------
         # *****off的值为什么是[0, 0],[1, 0], [0, 1], [-1, 0], [0, -1]？？*****
         # 答：对应与后面的offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]和gij = (gxy - offsets).long()，
@@ -209,14 +220,16 @@ class ComputeLoss:
         # [0, -1]：gxy中，对于处于格子水平中心线下边的目标，将他们上方的格子筛选出来用于预测这个目标。gxy - offsets得到的坐标处于下边格子，
         # 再用.long()函数得到下边格子的左上角坐标。
         # 最终，gij = (gxy - offsets).long()筛选出了分配有anchor的目标所处的格子和这些目标相邻的格子用于预测目标
+        # *** 注意：这里有*g操作，最终off = [0, 0],[0.5, 0], [0, 0.5], [-0.5, 0], [0, -0.5] ***
         off = torch.tensor([[0, 0],
                             [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
                             # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                             ], device=targets.device).float() * g  # offsets
 
-        # 遍历每个特征层，将每个目标分配到这个特征层对应的anchor. nl为最后用于检测的特征层数量
+        # ----- 3. 遍历每个特征层，将每个目标分配到这个特征层对应的anchor. nl为最后用于检测的特征层数量 -----
         for i in range(self.nl):
-            anchors = self.anchors[i]         # 得到当前anchor的尺度
+            # ----- 3.1 将gt box的x,y,w,h转换到当前特征图尺度下的坐标和宽高-----
+            anchors = self.anchors[i]           # 得到当前anchor的尺度
             # temp1 = p[i].shape                # 这里得到了当前特征层的维度值，是一维向量，值为[16, 3, 80, 80, 85]
             # temp2 = torch.tensor(p[i].shape)  # 将temp1转换为tensor [16, 3, 80, 80, 85]，对应[b, c, h, w, classes+5]
             # temp3的值为[80, 80, 80, 80],这里取出了temp2中的w,h,w,h，用于t = targets * gain中将每个目标的归一化坐标x,y,w,h
@@ -227,13 +240,14 @@ class ComputeLoss:
             gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
 
             # Match targets to anchors
-            # ---------- 此时x,y,w,h被转换到了当前特征图尺度下的坐标和宽高 ----------
+            # ----- 将x,y,w,h转换到当前特征图尺度下的坐标和宽高 -----
             # [3x204x7]*[7] --> [3x204x7]，这里用广播的机制相乘，得到了每个目标在当前特征层尺度下的x,y,w,h
             # 此时每个目标的标签为[image_id, class, x, y, w, h, anchor_id]，x,y,w,h已经是当前特征图尺度下的坐标和宽高
             t = targets * gain  # [3x204x7]*[7] --> [3x204x7]
-            # 当有目标标签存在时，进行标签和anchor匹配
+            # ----- 当有目标标签存在时，进行标签和anchor匹配 -----
             if nt:
-                # Matches
+                # ----- 3.2 Matches -----
+                # ----- 匹配achor和gt box，筛选出真正被分配有gt box的anchor对应的真实标签-----
                 # temp1 = t[:, :, 4:6]  # shape: [3x204x2]
                 # temp1的shape: [3x204x2]，取出所有目标的w,h。为了便于理解，可以假设把204维度去掉得到[3x2]的tensor，
                 # 可知每个目标的w,h复制了3次
@@ -261,7 +275,7 @@ class ComputeLoss:
                 # 另外，此时标签的x,y,w,h已经被转换到当前特征层尺度坐标系
                 t = t[j]  # filter, shape: [3x204x7] --> [274x7]
 
-                # Offsets
+                # ----- 3.3 计算Offsets ？？ -----
                 # 得到所有被分配有目标的anchor对应目标在当前特征层中的真实x, y坐标，即相对于特征层左上角的x,y值
                 gxy = t[:, 2:4]  # grid xy, shape: [274x2],
                 # 以当前特征层的右下角为原点，得到所有被分配有目标的anchor对应目标在当前特征层中距离最右下角的x,y坐标
@@ -331,10 +345,10 @@ class ComputeLoss:
                 # 中x2那个维度，就看j这个[5x274]去筛选temp3中[5x274]的维度。对于j这个5行274列的tensor，0-4行的元素，为True的那些元素分别
                 # 表示每个是否为目标x,y本身，以及在格子中偏左、上、右、下的目标。
                 # 第一行全部元素为True，筛选除了所有分配有anchor的目标本身的偏移量，为0
-                # 第二行中为True的元素筛选出了处于格子左边的目标的x方向偏移量，为1
-                # 第三行中为True的元素筛选出了处于格子上边的目标的y方向偏移量，为1
-                # 第四行中为True的元素筛选出了处于格子右边的目标的x方向偏移量，为-1
-                # 第五行中为True的元素筛选出了处于格子下边的目标的y方向偏移量，为-1
+                # 第二行中为True的元素筛选出了处于格子左边的目标的x方向偏移量，为0.5
+                # 第三行中为True的元素筛选出了处于格子上边的目标的y方向偏移量，为0.5
+                # 第四行中为True的元素筛选出了处于格子右边的目标的x方向偏移量，为-0.5
+                # 第五行中为True的元素筛选出了处于格子下边的目标的y方向偏移量，为-0.5
 
                 # *****offsets是什么？*****
                 # 最终，offsets表示所有分配有anchor的目标，以及这些目标中处于格子中偏左、上、右、下的目标所对应的，后面用于筛选相邻格子
@@ -349,6 +363,8 @@ class ComputeLoss:
                 offsets = 0
 
             # Define
+            # ----- 3.4 定义经过匹配增加后的所有gt boxes在当前feature map上的各种参数 -----
+            # ----- 包括：所有gt boxes在这个batch中的id、类别、在feature map上的坐标gxy、宽高gwh、所处格子左上角坐标gij-----
             b, c = t[:, :2].long().T  # image, class. b:[813], c:[813]，得到了所有筛选出来的目标在这个batch中的id和类别
             gxy = t[:, 2:4]  # [813x2], grid xy，得到了所有筛选出来的目标的x,y坐标
             gwh = t[:, 4:6]  # [813x2], grid wh，得到了所有筛选出来的目标的w,h值
@@ -360,6 +376,12 @@ class ComputeLoss:
             gi, gj = gij.T  # grid xy indices, gi:[813], gj:[813x2]
 
             # Append
+            # ----- 3.5 将最终的生成的标签参数添加到各自的列表中，包括以下部分 -----
+            # indices: 匹配增加后的所有gt boxes对应的anchor在当前特征图中的索引，用于定位每个gt box在预测值中对应位置
+            # tbox: 匹配增加后的所有gt boxes的cx,cy对应的归一化的预测偏差目标值和未归一化的w,h值
+            # tcls：匹配增加后的所有gt boxes的类别
+            # anch：匹配增加后的所有gt boxes的对应anchor的w,h值
+
             # a = t[:, 6].long()得到了前面筛选出来的所有分配有anchor的目标本身，以及这些目标中满足处于格子中偏左、上、右、下条件的目标，
             # 跟它们匹配上的anchor的id
             a = t[:, 6].long()  # anchor indices，[813]
@@ -374,8 +396,9 @@ class ComputeLoss:
             indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
 
             # -----添加当前特征层要预测的x,y,w,h对应的真实标签-----
-            # gxy - gij：筛选出来的目标在当前特征图尺度下的坐标减去用于预测它的格子的左上角坐标，得到x,y对应的预测值
-            # gwh:筛选出来的目标在当前特征图尺度下的宽高
+            # gxy - gij：筛选出来的目标在当前特征图尺度下的坐标减去用于预测它的格子的左上角坐标，得到cx,cy对应的预测偏差目标值
+            # gwh:筛选出来的目标在当前特征图尺度下的宽高。
+            # *** 归一化的预测偏差目标值在此处实现 ***
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             # 添加筛选出来的目标所匹配的anchor的宽高值
             anch.append(anchors[a])  # anchors
